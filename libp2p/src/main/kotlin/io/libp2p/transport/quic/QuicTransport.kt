@@ -2,10 +2,8 @@ package io.libp2p.transport.quic
 
 import io.libp2p.core.*
 import io.libp2p.core.crypto.PrivKey
-import io.libp2p.core.crypto.unmarshalPublicKey
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.MultiaddrDns
-import io.libp2p.core.multiformats.Multihash
 import io.libp2p.core.multiformats.Protocol.*
 import io.libp2p.core.multistream.MultistreamProtocol
 import io.libp2p.core.multistream.MultistreamProtocolV1
@@ -22,8 +20,7 @@ import io.libp2p.etc.util.netty.nettyInitializer
 import io.libp2p.security.tls.Libp2pTrustManager
 import io.libp2p.security.tls.buildCert
 import io.libp2p.security.tls.getJavaKey
-import io.libp2p.security.tls.getPublicKeyFromCert
-import io.libp2p.security.tls.verifyAndExtractPeerId
+import io.libp2p.security.tls.verifyAndExtractIdentity
 import io.libp2p.transport.implementation.ConnectionOverNetty
 import io.libp2p.transport.implementation.NettyTransport
 import io.netty.bootstrap.Bootstrap
@@ -270,31 +267,30 @@ class QuicTransport(
                     val peerCerts = it.sslEngine()?.session?.peerCertificates
                         ?: throw Libp2pException("No peer certificates available after QUIC handshake with $addr")
 
+                    // The libp2p host pubkey is carried in the cert extension and is the only
+                    // source of truth for `SecureChannel.Session.remotePubKey` (regardless of how
+                    // the peer id was encoded on the wire — `identity` digest vs. sha-256). The
+                    // ephemeral cert subject key MUST NOT be exposed here; doing so breaks the
+                    // invariant `PeerId.fromPubKey(remotePubKey) == remoteId` that the rest of the
+                    // libp2p stack relies on. Read it from this connection's verified certificates,
+                    // not the shared trust-manager state (avoids a cross-connection race).
+                    val remoteIdentity = verifyAndExtractIdentity(peerCerts)
                     val expectedPeerId = addr.getPeerId()
-                    val remotePeerId: PeerId
-                    val remotePubKey: io.libp2p.core.crypto.PubKey
-
-                    if (expectedPeerId != null) {
-                        // PeerId was pre-validated by trustManager during TLS handshake.
-                        // For inline-key peerIds (identity multihash), extract pubkey from the multihash.
-                        val pubHash = Multihash.of(expectedPeerId.bytes.toByteBuf())
-                        remotePubKey = if (pubHash.desc.digest == Multihash.Digest.Identity) {
-                            unmarshalPublicKey(pubHash.bytes.toByteArray())
-                        } else {
-                            getPublicKeyFromCert(peerCerts)
-                        }
-                        remotePeerId = expectedPeerId
-                    } else {
-                        // No PeerId known upfront — extract from TLS certificate post-handshake.
-                        remotePubKey = getPublicKeyFromCert(peerCerts)
-                        remotePeerId = verifyAndExtractPeerId(peerCerts)
+                    if (expectedPeerId != null && remoteIdentity.peerId != expectedPeerId) {
+                        // Defence-in-depth: Libp2pTrustManager already enforces this when an
+                        // expectedRemotePeer is provided, but assert at the session-construction
+                        // site so a misconfigured trust manager cannot silently leak the wrong
+                        // identity into the connection.
+                        throw Libp2pException(
+                            "Remote peer presented libp2p pubkey for ${remoteIdentity.peerId} but dial target was $expectedPeerId"
+                        )
                     }
 
                     connection.setSecureSession(
                         SecureChannel.Session(
                             PeerId.fromPubKey(localKey.publicKey()),
-                            remotePeerId,
-                            remotePubKey,
+                            remoteIdentity.peerId,
+                            remoteIdentity.pubKey,
                             null
                         )
                     )
@@ -415,16 +411,19 @@ class QuicTransport(
                                 val peerCerts = (ctx.channel() as QuicChannel).sslEngine()
                                     ?.session?.peerCertificates
                                 if (!peerCerts.isNullOrEmpty()) {
-                                    val remotePeerId = verifyAndExtractPeerId(peerCerts)
-                                    val remotePublicKey = getPublicKeyFromCert(peerCerts)
+                                    // Both remoteId and remotePubKey must come from the same libp2p
+                                    // host key carried in the certificate extension — never from the
+                                    // ephemeral cert subject key. See SecureChannel.Session contract:
+                                    // PeerId.fromPubKey(remotePubKey) == remoteId.
+                                    val remoteIdentity = verifyAndExtractIdentity(peerCerts)
 
-                                    logger.info("Handshake completed with remote peer id: {}", remotePeerId)
+                                    logger.info("Handshake completed with remote peer id: {}", remoteIdentity.peerId)
 
                                     connection.setSecureSession(
                                         SecureChannel.Session(
                                             PeerId.fromPubKey(localKey.publicKey()),
-                                            remotePeerId,
-                                            remotePublicKey,
+                                            remoteIdentity.peerId,
+                                            remoteIdentity.pubKey,
                                             null
                                         )
                                     )
@@ -533,15 +532,22 @@ class QuicTransport(
                 val peerCerts = quicChannel.sslEngine()?.session?.peerCertificates
                     ?: throw Libp2pException("No peer certificates in hole-punched connection from $addr")
 
+                // remoteId and remotePubKey must both come from the libp2p host key in the cert
+                // extension (never the ephemeral cert subject key), so PeerId.fromPubKey(remotePubKey)
+                // == remoteId holds. See SecureChannel.Session contract.
+                val remoteIdentity = verifyAndExtractIdentity(peerCerts)
                 val expectedPeerId = addr.getPeerId()
-                val remotePeerId = expectedPeerId ?: verifyAndExtractPeerId(peerCerts)
-                val remotePubKey = getPublicKeyFromCert(peerCerts)
+                if (expectedPeerId != null && remoteIdentity.peerId != expectedPeerId) {
+                    throw Libp2pException(
+                        "Remote peer presented libp2p pubkey for ${remoteIdentity.peerId} but dial target was $expectedPeerId"
+                    )
+                }
 
                 connection.setSecureSession(
                     SecureChannel.Session(
                         PeerId.fromPubKey(localKey.publicKey()),
-                        remotePeerId,
-                        remotePubKey,
+                        remoteIdentity.peerId,
+                        remoteIdentity.pubKey,
                         null
                     )
                 )
