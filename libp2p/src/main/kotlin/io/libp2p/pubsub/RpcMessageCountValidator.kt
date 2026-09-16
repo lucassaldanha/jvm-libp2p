@@ -30,6 +30,7 @@ object RpcMessageCountValidator {
     private const val RPC_PUBLISH = Rpc.RPC.PUBLISH_FIELD_NUMBER
     private const val RPC_CONTROL = Rpc.RPC.CONTROL_FIELD_NUMBER
     private const val RPC_PARTIAL = Rpc.RPC.PARTIAL_FIELD_NUMBER
+    private const val RPC_TEST_EXTENSION = Rpc.RPC.TESTEXTENSION_FIELD_NUMBER
 
     // pubsub.Message field numbers
     private const val MESSAGE_TOPIC_IDS = Rpc.Message.TOPICIDS_FIELD_NUMBER
@@ -131,6 +132,16 @@ object RpcMessageCountValidator {
                     val length = input.readRawVarint32()
                     val oldLimit = input.pushLimit(length)
                     scanControl(input, fields)?.let { return it }
+                    input.popLimit(oldLimit)
+                }
+                fieldNumber == RPC_TEST_EXTENSION &&
+                    wireType == WireFormat.WIRETYPE_LENGTH_DELIMITED -> {
+                    // TestExtension is a known but empty message: protobuf-java parses it and retains
+                    // everything inside as unknown fields, so its interior must be walked. skipField
+                    // would jump it whole, leaving those retained fields uncounted.
+                    val length = input.readRawVarint32()
+                    val oldLimit = input.pushLimit(length)
+                    scanFlat(input, fields)?.let { return it }
                     input.popLimit(oldLimit)
                 }
                 else -> skipCounting(input, tag, fields)?.let { return it }

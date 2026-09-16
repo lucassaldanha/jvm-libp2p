@@ -403,6 +403,28 @@ class RpcMessageCountValidatorTest {
             .hasSize(1_000)
     }
 
+    /**
+     * TestExtension is a known but empty message field, so protobuf-java parses it and retains its
+     * whole interior as unknown fields. The walker must descend into it; treating it as one opaque
+     * field would let a peer smuggle unbounded retained fields past [PubsubRpcLimits.maxTotalFields].
+     */
+    @Test
+    fun `fields inside a known testExtension message are counted`() {
+        val inner = ByteArray(40_000 * 2) { if (it % 2 == 0) 0x08 else 0x01 }
+        val raw = varint((6492434 shl 3) or 2) + varint(inner.size) + inner
+        val limits = PubsubRpcLimits.NONE.copy(
+            maxControlMessageSize = 256 * 1024,
+            maxTotalFields = 32768,
+        )
+
+        // The threat is real: protobuf-java retains the interior as unknown fields on the parsed
+        // known message rather than a single opaque body.
+        assertThat(Rpc.RPC.parseFrom(raw).testExtension.unknownFields.asMap()).isNotEmpty()
+
+        assertThat(RpcMessageCountValidator.validate(Unpooled.wrappedBuffer(raw), limits))
+            .isEqualTo(RpcMessageCountValidator.Result.Rejected("total fields > 32768"))
+    }
+
     private fun limitsWithFields(max: Int) = PubsubRpcLimits.NONE.copy(maxTotalFields = max)
 
     /** An unknown group holding [innerFields] two-byte varint fields. */
