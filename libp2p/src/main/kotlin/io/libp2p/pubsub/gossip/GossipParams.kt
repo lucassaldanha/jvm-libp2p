@@ -334,9 +334,15 @@ data class GossipParams(
      * ~16 characters, batching subscriptions or small unsigned publishes, lands near 8 bytes per
      * field and would trip a tighter setting.
      *
-     * Inbound only, like [maxSubscriptionsPerRpc]: the outbound batcher splits on bytes, not field
-     * count, so a value below what this library itself emits would make it produce frames its own
-     * guard rejects. Null disables the check.
+     * Enforced on both sides: [io.libp2p.pubsub.RpcMessageCountValidator] rejects an inbound RPC over
+     * the limit, and the outbound batcher [io.libp2p.pubsub.gossip.DefaultGossipRpcPartsQueue] splits
+     * batches on the same budget (and refuses a single part that exceeds it), so this library never
+     * emits a frame its own guard would reject.
+     *
+     * The default is a loose backstop rather than a tight cap: for real Ethereum shapes, where each
+     * field carries a ~22-byte message id or a topic, the [maxControlMessageSize] byte budget binds
+     * first, so the field limit mainly catches empty-envelope attacks. A consumer such as Teku may
+     * set a lower value to tighten that catch. Null disables the check.
      */
     val maxTotalFields: Int? = 65536
 
