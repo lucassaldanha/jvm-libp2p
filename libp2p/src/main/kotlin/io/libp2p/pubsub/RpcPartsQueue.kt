@@ -153,7 +153,9 @@ abstract class AbstractRpcPartsQueue : RpcPartsQueue {
 
         // The `publish` entry itself, then one per field set inside the Message. Pinned against the
         // inbound walker by RpcPartsFieldCountTest; schema changes are guarded by RpcSchemaAccountingTest.
-        override val estimatedMaxFieldCount: Int = run {
+        // FloodRouter shares this part but never reads the field count, so defer the work (including
+        // walking unknown fields). Queue access is single-threaded, so synchronization is unnecessary.
+        override val estimatedMaxFieldCount: Int by lazy(LazyThreadSafetyMode.NONE) {
             var n = 1 + message.topicIDsCount
             if (message.hasFrom()) n++
             if (message.hasData()) n++

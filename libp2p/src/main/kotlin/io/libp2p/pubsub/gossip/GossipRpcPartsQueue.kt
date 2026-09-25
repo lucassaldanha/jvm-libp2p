@@ -132,8 +132,10 @@ open class DefaultGossipRpcPartsQueue(
         // extension's sub-messages, and ControlExtensions holds only scalars, so this is flat.
         // Pinned against the inbound walker by RpcPartsFieldCountTest; schema changes are guarded
         // by RpcSchemaAccountingTest.
-        override val estimatedMaxFieldCount: Int
-            get() = 2 +
+        // The extension is immutable, so count once instead of walking its unknown fields
+        // again at enqueue and during batching.
+        override val estimatedMaxFieldCount: Int =
+            2 +
                 (if (ctrlExtension.hasPartialMessages()) 1 else 0) +
                 (if (ctrlExtension.hasTestExtension()) 1 else 0) +
                 countUnknownFields(ctrlExtension.unknownFields)
