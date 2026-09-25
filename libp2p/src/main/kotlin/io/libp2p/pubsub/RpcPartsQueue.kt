@@ -152,7 +152,7 @@ abstract class AbstractRpcPartsQueue : RpcPartsQueue {
         }
 
         // The `publish` entry itself, then one per field set inside the Message. Pinned against the
-        // inbound walker, and against Rpc.Message's field list, by RpcPartsFieldCountTest.
+        // inbound walker by RpcPartsFieldCountTest; schema changes are guarded by RpcSchemaAccountingTest.
         override val estimatedMaxFieldCount: Int = run {
             var n = 1 + message.topicIDsCount
             if (message.hasFrom()) n++

@@ -171,29 +171,4 @@ class RpcPartsFieldCountTest {
             )
         }
     }
-
-    /**
-     * [io.libp2p.pubsub.AbstractRpcPartsQueue.PublishPart] and [ControlExtensionPart] spell their
-     * fields out one by one, so a new field in `rpc.proto` would be silently uncounted - and an
-     * under-count is emitted, then rejected pre-decode by the peer. Adding a field here must fail
-     * until its formula is updated.
-     */
-    @Test
-    fun `the hand-counted messages still have the fields their formulas enumerate`() {
-        assertThat(Rpc.Message.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("from", "data", "seqno", "topicIDs", "signature", "key")
-
-        assertThat(Rpc.ControlExtensions.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("partialMessages", "testExtension")
-
-        // SubscriptionPart and the control parts are constants for the same reason.
-        assertThat(Rpc.RPC.SubOpts.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("subscribe", "topicid", "requestsPartial", "supportsSendingPartial")
-        assertThat(Rpc.ControlIHave.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("topicID", "messageIDs")
-        assertThat(Rpc.ControlPrune.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("topicID", "peers", "backoff")
-        assertThat(Rpc.PeerInfo.getDescriptor().fields.map { it.name })
-            .containsExactlyInAnyOrder("peerID", "signedPeerRecord")
-    }
 }

@@ -130,8 +130,8 @@ open class DefaultGossipRpcPartsQueue(
 
         // control + extensions, then one per set flag. The inbound walker does not descend into the
         // extension's sub-messages, and ControlExtensions holds only scalars, so this is flat.
-        // Pinned against the inbound walker, and against Rpc.ControlExtensions' field list, by
-        // RpcPartsFieldCountTest.
+        // Pinned against the inbound walker by RpcPartsFieldCountTest; schema changes are guarded
+        // by RpcSchemaAccountingTest.
         override val estimatedMaxFieldCount: Int
             get() = 2 +
                 (if (ctrlExtension.hasPartialMessages()) 1 else 0) +
