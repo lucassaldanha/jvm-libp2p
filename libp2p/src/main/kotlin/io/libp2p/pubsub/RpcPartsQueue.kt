@@ -1,7 +1,5 @@
 package io.libp2p.pubsub
 
-import com.google.protobuf.Descriptors.FieldDescriptor
-import com.google.protobuf.Message
 import com.google.protobuf.UnknownFieldSet
 import io.libp2p.etc.types.forward
 import pubsub.pb.Rpc
@@ -91,38 +89,14 @@ interface RpcPartsQueue {
 }
 
 /**
- * Counts protobuf field occurrences in [message], descending into every sub-message, matching
- * [io.libp2p.pubsub.RpcMessageCountValidator]'s inbound accounting: each repeated element and each
- * set singular field is one field, and message-typed fields also add the fields of their bodies.
- * Exact for the well-formed messages this library builds (no unknown fields, no groups).
+ * Counts the unknown protobuf fields protobuf-java retained on a parsed message.
+ *
+ * A forwarded message carries the unknown fields its sender included, and protobuf-java
+ * re-serializes them, so the inbound walker charges them and an outbound estimate that ignored them
+ * would under-count. Each scalar occurrence is one field; a group is one field plus its interior,
+ * matching [RpcMessageCountValidator]'s `skipCounting`.
  */
-private fun countFields(message: Message): Int {
-    var count = 0
-    for (entry in message.allFields) {
-        val field = entry.key
-        val value = entry.value
-        if (field.isRepeated) {
-            val elements = value as List<*>
-            count += elements.size
-            if (field.javaType == FieldDescriptor.JavaType.MESSAGE) {
-                elements.forEach { count += countFields(it as Message) }
-            }
-        } else {
-            count += 1
-            if (field.javaType == FieldDescriptor.JavaType.MESSAGE) {
-                count += countFields(value as Message)
-            }
-        }
-    }
-    // Unknown fields are excluded from allFields but protobuf-java retains and re-serializes them,
-    // and the inbound walker charges them, so a forwarded message carrying unknowns would be
-    // under-estimated without this. Each scalar occurrence is one field; a group is one field plus
-    // its interior, matching RpcMessageCountValidator.skipCounting.
-    count += countUnknownFields(message.unknownFields)
-    return count
-}
-
-private fun countUnknownFields(unknownFields: UnknownFieldSet): Int {
+internal fun countUnknownFields(unknownFields: UnknownFieldSet): Int {
     var count = 0
     for (entry in unknownFields.asMap()) {
         val field = entry.value
@@ -152,16 +126,19 @@ abstract class AbstractRpcPartsQueue : RpcPartsQueue {
         }
 
         /**
-         * Conservative upper bound for the number of protobuf fields this part contributes to a
-         * merged RPC, counted exactly as [io.libp2p.pubsub.RpcMessageCountValidator] counts them on
-         * the inbound side (one per field occurrence, descending into every sub-message). Based on
-         * the part's standalone RPC, so it over-counts once parts merge and share protobuf wrappers,
-         * which errs towards splitting a batch earlier than strictly required - the queue must never
-         * emit an RPC that a peer running this same code would reject pre-decode.
+         * Number of protobuf fields this part's standalone RPC contains, counted exactly as
+         * [RpcMessageCountValidator] counts them on the inbound side: one per field occurrence at
+         * every nesting level. Over-counts once parts merge and share protobuf wrappers, which errs
+         * towards splitting a batch earlier than strictly required - the queue must never emit an
+         * RPC that a peer running this same code would reject pre-decode.
+         *
+         * Every part states its own count instead of deriving one by protobuf reflection: a part's
+         * shape is fixed and known here at compile time, and reflecting over it costs two orders of
+         * magnitude more than reading it off the part, on the event thread, once per peer. A new
+         * part type therefore fails to compile until it states a count, and
+         * `RpcPartsFieldCountTest` pins each count against the real inbound walker.
          */
-        val estimatedMaxFieldCount: Int by lazy {
-            countFields(Rpc.RPC.newBuilder().also { appendToBuilder(it) }.buildPartial())
-        }
+        abstract val estimatedMaxFieldCount: Int
 
         open val writePromise: CompletableFuture<Unit>? = null
     }
@@ -172,6 +149,18 @@ abstract class AbstractRpcPartsQueue : RpcPartsQueue {
     ) : AbstractPart() {
         override fun appendToBuilder(builder: Rpc.RPC.Builder) {
             builder.addPublish(message)
+        }
+
+        // The `publish` entry itself, then one per field set inside the Message. Pinned against the
+        // inbound walker, and against Rpc.Message's field list, by RpcPartsFieldCountTest.
+        override val estimatedMaxFieldCount: Int = run {
+            var n = 1 + message.topicIDsCount
+            if (message.hasFrom()) n++
+            if (message.hasData()) n++
+            if (message.hasSeqno()) n++
+            if (message.hasSignature()) n++
+            if (message.hasKey()) n++
+            n + countUnknownFields(message.unknownFields)
         }
 
         override fun toString(): String =
@@ -189,6 +178,9 @@ abstract class AbstractRpcPartsQueue : RpcPartsQueue {
                 setSubscribe(status == RpcPartsQueue.SubscriptionStatus.Subscribed)
             }
         }
+
+        // subscriptions entry + subscribe + topicid
+        override val estimatedMaxFieldCount: Int get() = 3
     }
 
     private var estimatedMaxSerializedSizeAccum: Int = 0

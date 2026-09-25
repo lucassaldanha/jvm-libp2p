@@ -8,6 +8,7 @@ import io.libp2p.pubsub.RpcPartsBatch
 import io.libp2p.pubsub.RpcPartsQueue
 import io.libp2p.pubsub.TooLargeMessageException
 import io.libp2p.pubsub.Topic
+import io.libp2p.pubsub.countUnknownFields
 import pubsub.pb.Rpc
 
 interface GossipRpcPartsQueue : RpcPartsQueue {
@@ -58,6 +59,9 @@ open class DefaultGossipRpcPartsQueue(
 
             iHaveBuilder.addMessageIDs(messageId.toProtobuf())
         }
+
+        // control + ihave entry + topicID + messageID
+        override val estimatedMaxFieldCount: Int get() = 4
     }
 
     protected data class IWantPart(val messageId: MessageId) : AbstractPart() {
@@ -70,6 +74,9 @@ open class DefaultGossipRpcPartsQueue(
             }
             iWantBuilder.addMessageIDs(messageId.toProtobuf())
         }
+
+        // control + iwant entry + messageID
+        override val estimatedMaxFieldCount: Int get() = 3
     }
 
     protected data class IDontWantPart(val messageId: MessageId) : AbstractPart() {
@@ -82,12 +89,18 @@ open class DefaultGossipRpcPartsQueue(
             }
             iDontWantBuilder.addMessageIDs(messageId.toProtobuf())
         }
+
+        // control + idontwant entry + messageID
+        override val estimatedMaxFieldCount: Int get() = 3
     }
 
     protected data class GraftPart(val topic: Topic) : AbstractPart() {
         override fun appendToBuilder(builder: Rpc.RPC.Builder) {
             builder.controlBuilder.addGraftBuilder().setTopicID(topic)
         }
+
+        // control + graft entry + topicID
+        override val estimatedMaxFieldCount: Int get() = 3
     }
 
     protected data class PrunePart(val topic: Topic, val backoffSeconds: Long?, val backoffPeers: List<PeerId>) :
@@ -104,12 +117,26 @@ open class DefaultGossipRpcPartsQueue(
                 )
             }
         }
+
+        // control + prune entry + topicID, then backoff plus (peers entry + peerID) per peer.
+        override val estimatedMaxFieldCount: Int
+            get() = 3 + if (backoffSeconds != null) 1 + 2 * backoffPeers.size else 0
     }
 
     protected data class ControlExtensionPart(val ctrlExtension: Rpc.ControlExtensions) : AbstractPart() {
         override fun appendToBuilder(builder: Rpc.RPC.Builder) {
             builder.controlBuilder.setExtensions(ctrlExtension)
         }
+
+        // control + extensions, then one per set flag. The inbound walker does not descend into the
+        // extension's sub-messages, and ControlExtensions holds only scalars, so this is flat.
+        // Pinned against the inbound walker, and against Rpc.ControlExtensions' field list, by
+        // RpcPartsFieldCountTest.
+        override val estimatedMaxFieldCount: Int
+            get() = 2 +
+                (if (ctrlExtension.hasPartialMessages()) 1 else 0) +
+                (if (ctrlExtension.hasTestExtension()) 1 else 0) +
+                countUnknownFields(ctrlExtension.unknownFields)
     }
 
     protected val priorityPartLists = listOf(
