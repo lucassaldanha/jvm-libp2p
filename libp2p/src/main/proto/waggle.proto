@@ -8,6 +8,10 @@ option java_outer_classname = "WaggleRpc";
 // First and only message a subscriber writes on a topic stream it opened.
 message TopicSubscription {
   required bytes topicID = 1;
+  // Not in the spec draft. go-waggle extension: 0 or absent is the control stream (messages
+  // without pieces, or everything when there is no data stream), 1 is the data stream
+  // (messages with pieces). Implementations that predate it ignore the field.
+  optional uint32 stream = 2;
 }
 
 // Every message the remote writes back on that stream.

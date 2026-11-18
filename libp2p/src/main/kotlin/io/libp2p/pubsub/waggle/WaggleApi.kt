@@ -2,6 +2,7 @@ package io.libp2p.pubsub.waggle
 
 import io.libp2p.core.Connection
 import io.libp2p.core.PeerId
+import java.time.Duration
 
 /**
  * Application-defined description of which pieces of an object a node holds or wants.
@@ -22,6 +23,10 @@ interface WaggleMetadata {
 /**
  * An immutable snapshot of the pieces of one object held locally.
  * Publish a new snapshot after integrating new pieces; never mutate a published one.
+ *
+ * Snapshots of an object must only grow. Waggle remembers which pieces it has sent to each peer
+ * and never sends them again, so publishing a snapshot that lacks pieces an earlier one had
+ * leaves peers believing we still hold them.
  */
 interface WaggleShard {
     /** Wire field `objectID`. */
@@ -35,7 +40,7 @@ interface WaggleShard {
      * @param peerMetadata the peer's tracked metadata, or null if nothing is known yet
      * @throws Exception if [peerMetadata] is malformed
      */
-    fun actionFor(peer: PeerId, connection: Connection, peerMetadata: ByteArray?): WaggleAction
+    fun actionFor(peer: PeerId, peerMetadata: ByteArray?): WaggleAction
 }
 
 /**
@@ -74,27 +79,50 @@ interface WaggleEventListener {
     /** A reply to [peer] was dropped because the connection's outbound queue is full. */
     fun onFullQueue(peer: PeerId, connection: Connection) {}
 
-    /** Our subscription stream for [topic] could not be opened, or was closed by the remote. Not retried. */
-    fun onStreamFailed(peer: PeerId, connection: Connection, topic: ByteArray, cause: Throwable?) {}
+    /**
+     * Our subscription stream for [topic] could not be opened ([cause] is set; typically the peer
+     * does not speak Waggle; never retried) or was closed by the remote ([cause] is null).
+     * @param willRetry the stream will be reopened after a backoff
+     */
+    fun onStreamFailed(peer: PeerId, connection: Connection, topic: ByteArray, cause: Throwable?, willRetry: Boolean) {}
 }
 
 data class WaggleTopicConfig(
-    /** Connections that receive a published snapshot (successful sends, not attempts). */
+    /** Peers we know nothing about that receive a published snapshot (successful sends, not attempts). */
     val publishFanout: Int = 50,
-    /** Other connections that get a metadata-only advert when a peer tells us something new. */
-    val gossipFanout: Int = 50
+    /** Peers whose view of the object we already track that receive what they lack on publish. */
+    val forwardFanout: Int = 50,
+    /** Other peers that get a metadata-only advert when a peer tells us something new. */
+    val gossipFanout: Int = 50,
+    /**
+     * Also open a separate data stream, so the remote can keep metadata ahead of payload
+     * (go-waggle extension, not in the spec draft). Peers that predate it reject the second
+     * stream and keep sending everything on the first.
+     */
+    val dataStream: Boolean = false
 )
 
 data class WaggleConfig(
     /** Maximum size of one protobuf frame. */
     val maxFrameSize: Int = 65536,
-    /** Messages queued and not yet written, per connection, across all topics. */
+    /** Messages handed to a connection and not yet written, across all its topics. */
     val maxQueuedMessagesPerConnection: Int = 5000,
+    /** Bytes handed to a connection and not yet written, across all its topics. */
+    val maxQueuedBytesPerConnection: Long = 4L * 1024 * 1024,
     /** Inbound subscription streams per connection, counted from stream open. */
     val maxInboundStreamsPerConnection: Int = 50,
     /** Snapshots cached per topic (LRU). */
     val maxCachedObjectsPerTopic: Int = 100,
+    /** A snapshot expires this long after it was last published; a peer view this long after it last changed. */
+    val objectLifetime: Duration = Duration.ofMinutes(5),
     val maxTopicIdSize: Int = 1024,
+    /** Delay before the first attempt to reopen a subscription stream the remote closed; doubles per attempt. */
+    val reopenInitialBackoff: Duration = Duration.ofSeconds(1),
+    val reopenMaxBackoff: Duration = Duration.ofSeconds(60),
+    /** Consecutive reopen attempts without receiving anything before giving up on a stream. */
+    val maxReopenAttempts: Int = 5,
+    /** Inbound subscriptions to topics this rejects are closed. Called on the event thread. */
+    val topicFilter: (ByteArray) -> Boolean = { true },
     val defaultTopicConfig: WaggleTopicConfig = WaggleTopicConfig(),
     val topicConfigs: Map<String, WaggleTopicConfig> = emptyMap()
 )
