@@ -36,7 +36,9 @@ configure(
         }
 ) {
     group = "io.libp2p"
-    version = "develop"
+    // Not "develop": that version exists upstream without Waggle, and a build that silently
+    // resolved it instead of this branch would fail in confusing ways.
+    version = "waggle-prototype"
 
     apply(plugin = "kotlin")
     apply(plugin = "idea")

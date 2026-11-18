@@ -362,6 +362,14 @@ class WaggleHostTest {
         Thread.sleep(200)
         assertThat(a.messages).isEmpty()
 
+        // A node can send on a topic it does not follow, as long as the peer follows it.
+        val other = "other-topic".toByteArray()
+        val otherFrames = CopyOnWriteArrayList<ByteArray?>()
+        b.waggle.subscribeRaw(other) { _, _, _, _, pieces -> otherFrames += pieces }.get()
+        waitFor("b subscribed to the other topic") { a.waggle.subscribers(other).get().isNotEmpty() }
+        a.waggle.send(other, b.host.peerId, byteArrayOf(2), null, byteArrayOf(9)).get(5, TimeUnit.SECONDS)
+        waitFor("b got the frame") { otherFrames.size == 1 }
+
         val toStranger = runCatching { a.waggle.send(topic, PeerId.random(), byteArrayOf(1), null, null).get(5, TimeUnit.SECONDS) }
         assertThat(toStranger.exceptionOrNull()?.cause).isInstanceOf(PeerNotSubscribedException::class.java)
         val managed = runCatching { a.waggle.publish(topic, TestShard(1, 1)).get(5, TimeUnit.SECONDS) }

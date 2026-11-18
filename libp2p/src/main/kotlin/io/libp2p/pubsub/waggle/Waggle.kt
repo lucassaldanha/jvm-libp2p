@@ -156,7 +156,8 @@ class Waggle @JvmOverloads constructor(
     }
 
     /**
-     * Sends one frame of a raw topic to [peer]. Completes when the frame has been written to the
+     * Sends one frame to [peer] on a raw topic, or on a topic we are not subscribed to at all
+     * (the peer has to be subscribed, we do not). Completes when the frame has been written to the
      * stream. Fails, without queueing anything, with [PeerNotSubscribedException] or
      * [QueueFullException].
      */
@@ -170,7 +171,9 @@ class Waggle @JvmOverloads constructor(
         val written = CompletableFuture<Unit>()
         submit {
             val t = WBytes(topic)
-            check(t in rawTopics) { "send() is only for topics subscribed with subscribeRaw()" }
+            // Sending needs the peer's subscription, not ours: a node can publish to a topic it
+            // does not follow. Only topics we manage with the engine are off limits.
+            check(t in rawTopics || t !in subscribedTopics) { "send() is not for topics subscribed with subscribe()" }
             val peerState = peers[peer]?.takeIf { it.subscribedTo(t) } ?: throw PeerNotSubscribedException()
             when (sendFrame(peerState, t, objectId, metadata, pieces, written)) {
                 SendResult.OK -> {}
