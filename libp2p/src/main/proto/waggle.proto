@@ -1,0 +1,18 @@
+syntax = "proto2";
+
+// Waggle wire format, as pinned by libp2p/specs#732 @ 9328b68 and sigp/waggle @ 4a42568.
+package waggle.pb;
+
+option java_outer_classname = "WaggleRpc";
+
+// First and only message a subscriber writes on a topic stream it opened.
+message TopicSubscription {
+  required bytes topicID = 1;
+}
+
+// Every message the remote writes back on that stream.
+message ObjectPieces {
+  required bytes objectID = 2;
+  optional bytes piecesMetadata = 3;
+  optional bytes pieces = 4;
+}
