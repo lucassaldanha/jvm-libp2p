@@ -106,11 +106,17 @@ class Waggle @JvmOverloads constructor(
 
     private enum class SendResult { OK, FULL, NOTHING }
 
+    /** What we hand to a send stream: the frame, and optionally a future completed when it is written. */
+    private class Outbound(val message: MessageLite, val written: CompletableFuture<Unit>?)
+
     // Everything below is confined to the event thread.
     private val state = WaggleState(config.maxCachedObjectsPerTopic, config.objectLifetime.toMillis(), clock)
     private val subscribedTopics = HashSet<WBytes>()
     private val connections = HashMap<Connection, ConnState>()
     private val peers = HashMap<PeerId, PeerState>()
+
+    /** Topics subscribed with [subscribeRaw]: their frames bypass the engine. */
+    private val rawTopics = HashMap<WBytes, WaggleRawHandler>()
 
     init {
         val sweepMillis = (config.objectLifetime.toMillis() / 4).coerceIn(1_000, 60_000)
@@ -135,9 +141,62 @@ class Waggle @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Subscribes to [topic] without the reconciliation engine: every frame goes to [handler]
+     * as it arrives and nothing is cached, answered or gossiped on our behalf. Send with [send].
+     * This is the layer to build a different forwarding strategy on; a topic is either raw or
+     * managed, never both.
+     */
+    fun subscribeRaw(topic: ByteArray, handler: WaggleRawHandler): CompletableFuture<Unit> = submit {
+        val t = WBytes(topic.copyOf())
+        check(t !in subscribedTopics) { "already subscribed to this topic" }
+        rawTopics[t] = handler
+        subscribedTopics += t
+        peers.values.forEach { peer -> peer.primary?.also { openRecvStreams(it, t) } }
+    }
+
+    /**
+     * Sends one frame of a raw topic to [peer]. Completes when the frame has been written to the
+     * stream. Fails, without queueing anything, with [PeerNotSubscribedException] or
+     * [QueueFullException].
+     */
+    fun send(
+        topic: ByteArray,
+        peer: PeerId,
+        objectId: ByteArray,
+        metadata: ByteArray?,
+        pieces: ByteArray?
+    ): CompletableFuture<Unit> {
+        val written = CompletableFuture<Unit>()
+        submit {
+            val t = WBytes(topic)
+            check(t in rawTopics) { "send() is only for topics subscribed with subscribeRaw()" }
+            val peerState = peers[peer]?.takeIf { it.subscribedTo(t) } ?: throw PeerNotSubscribedException()
+            when (sendFrame(peerState, t, objectId, metadata, pieces, written)) {
+                SendResult.OK -> {}
+                SendResult.FULL -> throw QueueFullException()
+                SendResult.NOTHING -> throw PeerNotSubscribedException()
+            }
+        }.whenComplete { _, error -> if (error != null) written.completeExceptionally(error.cause ?: error) }
+        return written
+    }
+
+    /**
+     * How many more frames for [topic] the connection to [peer] accepts right now: 0 when the
+     * peer is not subscribed or the queue is full.
+     */
+    fun sendCapacity(topic: ByteArray, peer: PeerId): CompletableFuture<Int> = submit {
+        val cs = peers[peer]?.sendStream(StreamKey(WBytes(topic), CONTROL_STREAM))?.first
+        when {
+            cs == null || cs.queuedBytes >= config.maxQueuedBytesPerConnection -> 0
+            else -> (config.maxQueuedMessagesPerConnection - cs.queuedMessages).coerceAtLeast(0)
+        }
+    }
+
     /** Closes our subscription streams for [topic] and drops everything cached for it. */
     fun unsubscribe(topic: ByteArray): CompletableFuture<Unit> = submit {
         val t = WBytes(topic)
+        rawTopics.remove(t)
         if (subscribedTopics.remove(t)) {
             for (cs in connections.values) {
                 val keys = cs.recvStreams.keys.filter { it.topic == t }
@@ -160,6 +219,7 @@ class Waggle @JvmOverloads constructor(
      */
     fun publish(topic: ByteArray, shard: WaggleShard): CompletableFuture<Int> = submit {
         val t = WBytes(topic)
+        check(t !in rawTopics) { "publish() is not for topics subscribed with subscribeRaw(); use send()" }
         val objectId = WBytes(shard.objectId())
         state.store(t, shard)
         val subscribers = peers.values.filter { it.subscribedTo(t) }.shuffled(random)
@@ -235,6 +295,18 @@ class Waggle @JvmOverloads constructor(
                 logger.debug("Too many inbound Waggle streams from {}", cs.peer.peerId)
                 stream.close()
             }
+            executor.schedule(
+                {
+                    guarded {
+                        if (cs.sendStreams.values.none { it === stream } && !stream.closeFuture().isDone) {
+                            logger.debug("No Waggle handshake from {} in time", cs.peer.peerId)
+                            stream.close()
+                        }
+                    }
+                },
+                config.handshakeTimeout.toMillis(),
+                TimeUnit.MILLISECONDS
+            )
         }
         return CompletableFuture.completedFuture(Unit)
     }
@@ -270,16 +342,20 @@ class Waggle @JvmOverloads constructor(
         }
 
         override fun write(ctx: ChannelHandlerContext, msg: Any, promise: ChannelPromise) {
-            val size = (msg as? MessageLite)?.serializedSize ?: 0
-            promise.addListener {
+            val outbound = msg as Outbound
+            val size = outbound.message.serializedSize
+            promise.addListener { result ->
                 onEventThread {
                     connections[stream.connection]?.also {
                         it.queuedMessages--
                         it.queuedBytes -= size
                     }
                 }
+                outbound.written?.also {
+                    if (result.isSuccess) it.complete(Unit) else it.completeExceptionally(result.cause())
+                }
             }
-            ctx.write(msg, promise)
+            ctx.write(outbound.message, promise)
         }
 
         override fun userEventTriggered(ctx: ChannelHandlerContext, evt: Any) {
@@ -464,6 +540,21 @@ class Waggle @JvmOverloads constructor(
         val objectId = WBytes(msg.objectID.toByteArray())
         val metadata = if (msg.hasPiecesMetadata()) msg.piecesMetadata.toByteArray() else null
         val pieces = if (msg.hasPieces()) msg.pieces.toByteArray() else null
+        listeners.forEach {
+            it.onFrameReceived(
+                peer.peerId,
+                conn,
+                topic.array,
+                objectId.array,
+                metadata?.size ?: -1,
+                pieces?.size ?: -1,
+                key.kind == DATA_STREAM
+            )
+        }
+        rawTopics[topic]?.also {
+            it.onMessage(peer.peerId, conn, objectId.array, metadata, pieces)
+            return
+        }
 
         val outcome = try {
             state.received(topic, peer.peerId, objectId, metadata, pieces)
@@ -509,16 +600,38 @@ class Waggle @JvmOverloads constructor(
         }
     }
 
-    private fun trySend(peer: PeerState, topic: WBytes, t: WaggleState.Transmission): SendResult {
+    private fun trySend(peer: PeerState, topic: WBytes, t: WaggleState.Transmission): SendResult =
+        try {
+            sendFrame(peer, topic, t.objectId, t.metadata, t.pieces, null)
+        } catch (e: IllegalArgumentException) {
+            // The application's shard produced a frame we cannot send.
+            peer.sendStream(StreamKey(topic, CONTROL_STREAM))?.first?.connection?.also { conn ->
+                listeners.forEach { it.onInvalidData(peer.peerId, conn, topic.array, t.objectId, e) }
+            }
+            SendResult.NOTHING
+        }
+
+    /**
+     * Admits one frame to the connection carrying the peer's subscription, or refuses it.
+     * @throws IllegalArgumentException if the frame exceeds `maxFrameSize`
+     */
+    private fun sendFrame(
+        peer: PeerState,
+        topic: WBytes,
+        objectId: ByteArray,
+        metadata: ByteArray?,
+        pieces: ByteArray?,
+        written: CompletableFuture<Unit>?
+    ): SendResult {
         // Payload goes to the data stream when the remote opened one, everything else to control.
-        val (cs, stream) = (if (t.pieces != null) peer.sendStream(StreamKey(topic, DATA_STREAM)) else null)
-            ?: peer.sendStream(StreamKey(topic, CONTROL_STREAM))
-            ?: return SendResult.NOTHING
-        val builder = ObjectPieces.newBuilder().setObjectID(ByteString.copyFrom(t.objectId))
-        t.metadata?.also { builder.piecesMetadata = ByteString.copyFrom(it) }
-        t.pieces?.also { builder.pieces = ByteString.copyFrom(it) }
+        val dataStream = if (pieces != null) peer.sendStream(StreamKey(topic, DATA_STREAM)) else null
+        val (cs, stream) = dataStream ?: peer.sendStream(StreamKey(topic, CONTROL_STREAM)) ?: return SendResult.NOTHING
+        val builder = ObjectPieces.newBuilder().setObjectID(ByteString.copyFrom(objectId))
+        metadata?.also { builder.piecesMetadata = ByteString.copyFrom(it) }
+        pieces?.also { builder.pieces = ByteString.copyFrom(it) }
         val msg = builder.build()
         val size = msg.serializedSize
+        require(size <= config.maxFrameSize) { "frame of $size bytes exceeds maxFrameSize ${config.maxFrameSize}" }
         if (cs.queuedMessages >= config.maxQueuedMessagesPerConnection ||
             cs.queuedBytes + size > config.maxQueuedBytesPerConnection
         ) {
@@ -526,7 +639,18 @@ class Waggle @JvmOverloads constructor(
         }
         cs.queuedMessages++
         cs.queuedBytes += size
-        stream.writeAndFlush(msg)
+        stream.writeAndFlush(Outbound(msg, written))
+        listeners.forEach {
+            it.onFrameSent(
+                peer.peerId,
+                cs.connection,
+                topic.array,
+                objectId,
+                metadata?.size ?: -1,
+                pieces?.size ?: -1,
+                dataStream != null
+            )
+        }
         return SendResult.OK
     }
 

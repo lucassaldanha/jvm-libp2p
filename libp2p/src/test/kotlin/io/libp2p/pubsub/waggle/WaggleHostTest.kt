@@ -10,6 +10,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -25,6 +26,12 @@ class WaggleHostTest {
         val subscribedPeers = CopyOnWriteArrayList<PeerId>()
         val unsubscribedPeers = CopyOnWriteArrayList<PeerId>()
         val receivedFrom = CopyOnWriteArrayList<PeerId>()
+
+        val invalidData = CopyOnWriteArrayList<Throwable>()
+
+        /** (piecesSize, dataStream) of every frame sent and received. */
+        val framesSent = CopyOnWriteArrayList<Pair<Int, Boolean>>()
+        val framesReceived = CopyOnWriteArrayList<Pair<Int, Boolean>>()
 
         /** willRetry of every onStreamFailed, in order. */
         val streamFailures = CopyOnWriteArrayList<Boolean>()
@@ -51,6 +58,34 @@ class WaggleHostTest {
 
                 override fun onUnsubscribed(peer: PeerId, connection: Connection, topic: ByteArray) {
                     unsubscribedPeers += peer
+                }
+
+                override fun onInvalidData(peer: PeerId, connection: Connection, topic: ByteArray, objectId: ByteArray, cause: Throwable) {
+                    invalidData += cause
+                }
+
+                override fun onFrameSent(
+                    peer: PeerId,
+                    connection: Connection,
+                    topic: ByteArray,
+                    objectId: ByteArray,
+                    metadataSize: Int,
+                    piecesSize: Int,
+                    dataStream: Boolean
+                ) {
+                    framesSent += piecesSize to dataStream
+                }
+
+                override fun onFrameReceived(
+                    peer: PeerId,
+                    connection: Connection,
+                    topic: ByteArray,
+                    objectId: ByteArray,
+                    metadataSize: Int,
+                    piecesSize: Int,
+                    dataStream: Boolean
+                ) {
+                    framesReceived += piecesSize to dataStream
                 }
 
                 override fun onStreamFailed(peer: PeerId, connection: Connection, topic: ByteArray, cause: Throwable?, willRetry: Boolean) {
@@ -254,6 +289,103 @@ class WaggleHostTest {
         b.publish(TestShard(1, 0b11110000))
         waitFor("both complete") { a.bits(1) == 0xFF && b.bits(1) == 0xFF }
         assertThat(a.streamFailures).isEmpty()
+
+        // a asked for a data stream: everything b sent with pieces went on it, the rest did not.
+        assertThat(b.framesSent.filter { it.first >= 0 }).isNotEmpty.allMatch { it.second }
+        assertThat(b.framesSent.filter { it.first < 0 }).noneMatch { it.second }
+        assertThat(a.framesReceived.filter { it.first >= 0 }).isNotEmpty.allMatch { it.second }
+        // b did not ask for one: a sends it everything on the single stream.
+        assertThat(a.framesSent).isNotEmpty.noneMatch { it.second }
+    }
+
+    @Test
+    fun `an inbound stream that never sends its handshake is closed`() {
+        val a = Node()
+        val b = Node(WaggleConfig(handshakeTimeout = Duration.ofMillis(200)))
+        a.connect(b)
+        // Open a /waggle/1.0 stream to b and say nothing.
+        val silent = ProtocolBinding.createSimple(WAGGLE_PROTOCOL_ID) { ch -> CompletableFuture.completedFuture(ch) }
+        val stream = silent.dial(a.host.host, b.host.peerId, b.host.listenAddress).stream.get(5, TimeUnit.SECONDS)
+
+        waitFor("silent stream closed") { stream.closeFuture().isDone }
+        assertThat(b.subscribedPeers).isEmpty()
+    }
+
+    @Test
+    fun `a frame larger than the limit is reported and not sent`() {
+        val a = Node(WaggleConfig(maxFrameSize = 16))
+        val b = Node()
+        a.connect(b)
+        subscribeBoth(a, b)
+
+        a.publish(TestShard(1, 0xFF)) // 9 bytes of pieces plus id and metadata: 17 bytes
+
+        waitFor("reported") { a.invalidData.isNotEmpty() }
+        assertThat(a.invalidData.first()).isInstanceOf(IllegalArgumentException::class.java)
+        assertThat(a.framesSent).isEmpty()
+        assertThat(b.bits(1)).isEqualTo(0)
+    }
+
+    @Test
+    fun `a raw topic hands frames straight to the application and sends on request`() {
+        class RawNode {
+            val waggle = Waggle()
+            val messages = CopyOnWriteArrayList<Triple<PeerId, ByteArray?, ByteArray?>>()
+            val host: TestHost
+
+            init {
+                hostFactory.protocols = listOf<ProtocolBinding<Any>>(Identify(), waggle)
+                host = hostFactory.createHost()
+            }
+        }
+        val a = RawNode()
+        val b = RawNode()
+        a.host.host.network.connect(b.host.peerId, b.host.listenAddress).get(5, TimeUnit.SECONDS)
+        a.waggle.subscribeRaw(topic) { peer, _, _, metadata, pieces -> a.messages += Triple(peer, metadata, pieces) }.get()
+        assertThat(a.waggle.sendCapacity(topic, b.host.peerId).get()).isEqualTo(0)
+        b.waggle.subscribeRaw(topic) { peer, _, _, metadata, pieces -> b.messages += Triple(peer, metadata, pieces) }.get()
+        waitFor("mutual subscription") {
+            a.waggle.subscribers(topic).get().isNotEmpty() && b.waggle.subscribers(topic).get().isNotEmpty()
+        }
+        assertThat(a.waggle.sendCapacity(topic, b.host.peerId).get()).isEqualTo(WaggleConfig().maxQueuedMessagesPerConnection)
+
+        // The future completes once the frame is written; absent and empty fields stay distinct.
+        a.waggle.send(topic, b.host.peerId, byteArrayOf(1), byteArrayOf(), null).get(5, TimeUnit.SECONDS)
+        a.waggle.send(topic, b.host.peerId, byteArrayOf(1), null, byteArrayOf(7, 8)).get(5, TimeUnit.SECONDS)
+        waitFor("b got both frames") { b.messages.size == 2 }
+        assertThat(b.messages[0].first).isEqualTo(a.host.peerId)
+        assertThat(b.messages[0].second).isEmpty()
+        assertThat(b.messages[0].third).isNull()
+        assertThat(b.messages[1].second).isNull()
+        assertThat(b.messages[1].third).containsExactly(7, 8)
+        // Nothing is answered or gossiped on a raw topic's behalf.
+        Thread.sleep(200)
+        assertThat(a.messages).isEmpty()
+
+        val toStranger = runCatching { a.waggle.send(topic, PeerId.random(), byteArrayOf(1), null, null).get(5, TimeUnit.SECONDS) }
+        assertThat(toStranger.exceptionOrNull()?.cause).isInstanceOf(PeerNotSubscribedException::class.java)
+        val managed = runCatching { a.waggle.publish(topic, TestShard(1, 1)).get(5, TimeUnit.SECONDS) }
+        assertThat(managed.exceptionOrNull()?.cause).isInstanceOf(IllegalStateException::class.java)
+    }
+
+    @Test
+    fun `a raw node pulls an object from a managed node`() {
+        val managed = Node()
+        val rawWaggle = Waggle()
+        val got = CopyOnWriteArrayList<ByteArray>()
+        hostFactory.protocols = listOf<ProtocolBinding<Any>>(Identify(), rawWaggle)
+        val rawHost = hostFactory.createHost()
+        rawHost.host.network.connect(managed.host.peerId, managed.host.listenAddress).get(5, TimeUnit.SECONDS)
+
+        managed.waggle.subscribe(topic).get()
+        managed.publish(TestShard(6, 0xFF))
+        // The raw application runs its own strategy: on hearing of the object it asks for everything.
+        rawWaggle.subscribeRaw(topic) { peer, _, objectId, _, pieces ->
+            if (pieces != null) got += pieces else rawWaggle.send(topic, peer, objectId, byteArrayOf(0), null)
+        }.get()
+
+        waitFor("pieces from the managed node") { got.isNotEmpty() }
+        assertThat(got.first()[0]).isEqualTo(0xFF.toByte())
     }
 
     @Test

@@ -85,6 +85,39 @@ interface WaggleEventListener {
      * @param willRetry the stream will be reopened after a backoff
      */
     fun onStreamFailed(peer: PeerId, connection: Connection, topic: ByteArray, cause: Throwable?, willRetry: Boolean) {}
+
+    /**
+     * Every ObjectPieces frame read from a peer, before Waggle decides whether it is useful.
+     * Meant for metrics and for scoring peers that send frames which never lead to [onReceived].
+     * @param metadataSize size of `piecesMetadata`, or -1 if absent
+     * @param piecesSize size of `pieces`, or -1 if absent
+     * @param dataStream the frame arrived on a data stream (go-waggle extension)
+     */
+    fun onFrameReceived(
+        peer: PeerId,
+        connection: Connection,
+        topic: ByteArray,
+        objectId: ByteArray,
+        metadataSize: Int,
+        piecesSize: Int,
+        dataStream: Boolean
+    ) {}
+
+    /** Every ObjectPieces frame admitted to a connection's queue. Sizes as in [onFrameReceived]. */
+    fun onFrameSent(
+        peer: PeerId,
+        connection: Connection,
+        topic: ByteArray,
+        objectId: ByteArray,
+        metadataSize: Int,
+        piecesSize: Int,
+        dataStream: Boolean
+    ) {}
+}
+
+/** Receives every message of a topic subscribed with [Waggle.subscribeRaw]. Called on the event thread. */
+fun interface WaggleRawHandler {
+    fun onMessage(peer: PeerId, connection: Connection, objectId: ByteArray, metadata: ByteArray?, pieces: ByteArray?)
 }
 
 data class WaggleTopicConfig(
@@ -116,6 +149,8 @@ data class WaggleConfig(
     /** A snapshot expires this long after it was last published; a peer view this long after it last changed. */
     val objectLifetime: Duration = Duration.ofMinutes(5),
     val maxTopicIdSize: Int = 1024,
+    /** An inbound stream that has not sent its TopicSubscription after this long is closed. */
+    val handshakeTimeout: Duration = Duration.ofSeconds(5),
     /** Delay before the first attempt to reopen a subscription stream the remote closed; doubles per attempt. */
     val reopenInitialBackoff: Duration = Duration.ofSeconds(1),
     val reopenMaxBackoff: Duration = Duration.ofSeconds(60),
@@ -126,6 +161,12 @@ data class WaggleConfig(
     val defaultTopicConfig: WaggleTopicConfig = WaggleTopicConfig(),
     val topicConfigs: Map<String, WaggleTopicConfig> = emptyMap()
 )
+
+/** The peer holds no subscription to the topic with us. */
+class PeerNotSubscribedException : RuntimeException("the peer is not subscribed to the topic")
+
+/** The connection's outbound queue is full; the message was not queued. */
+class QueueFullException : RuntimeException("the connection's outbound queue is full")
 
 class NoSubscribersException : RuntimeException("no peers subscribed to the topic")
 
